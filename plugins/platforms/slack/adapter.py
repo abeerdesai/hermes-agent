@@ -1006,6 +1006,12 @@ class SlackAdapter(BasePlatformAdapter):
         # eviction (key[2] is the thread ts).
         self._active_status_threads: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._ACTIVE_STATUS_THREADS_MAX = 1000
+        # Terminal status clears sit on the user-visible critical path: Slack's
+        # Assistant status persists after a turn unless setStatus("") lands.
+        # Retry only transient failures, keep the exact tracked lease on
+        # terminal failure, and surface the failure at warning level.
+        self._STATUS_CLEAR_MAX_ATTEMPTS = 3
+        self._STATUS_CLEAR_RETRY_DELAYS = (0.1, 0.5)
         # Best-effort guard so automatic Slack AI thread titles are set once
         # per visible DM thread instead of on every reply.
         self._titled_assistant_threads: set = set()
@@ -2889,16 +2895,38 @@ class SlackAdapter(BasePlatformAdapter):
             # mid-turn "you there?" pings. Stored inside the tracked status
             # entry so it shares the existing bounds/eviction and is dropped
             # by stop_typing with the rest of the status state.
+            _owner_message_id = str(
+                (metadata or {}).get("message_id") or ""
+            )
             _prev_entry = self._active_status_threads.get(status_key)
-            if isinstance(_prev_entry, dict):
+            _same_lease = (
+                isinstance(_prev_entry, dict)
+                and str(_prev_entry.get("owner_message_id") or "")
+                == _owner_message_id
+            )
+            if _same_lease:
                 _status_started = _prev_entry.get("started")
             if not isinstance(_status_started, (int, float)):
                 _status_started = time.monotonic()
-            self._active_status_threads[status_key] = {
-                "thread_ts": str(thread_ts),
-                "team_id": str(team_id) if team_id else "",
-                "started": _status_started,
-            }
+            if _same_lease:
+                # Preserve object identity across heartbeat refreshes. A clear
+                # that is in flight can then remove this lease after success
+                # without deleting a newer turn that replaced the entry.
+                _prev_entry.update(
+                    {
+                        "thread_ts": str(thread_ts),
+                        "team_id": str(team_id) if team_id else "",
+                        "started": _status_started,
+                        "owner_message_id": _owner_message_id,
+                    }
+                )
+            else:
+                self._active_status_threads[status_key] = {
+                    "thread_ts": str(thread_ts),
+                    "team_id": str(team_id) if team_id else "",
+                    "started": _status_started,
+                    "owner_message_id": _owner_message_id,
+                }
             if len(self._active_status_threads) > self._ACTIVE_STATUS_THREADS_MAX:
                 # Evict abandoned statuses oldest-thread-first (key[2] is the
                 # thread ts) so an eviction never clears the newest status.
@@ -2957,7 +2985,11 @@ class SlackAdapter(BasePlatformAdapter):
                 metadata.get("thread_id") or metadata.get("thread_ts") or ""
             )
         requested_team_id = self._metadata_team_id(metadata)
+        requested_owner_message_id = str(
+            (metadata or {}).get("message_id") or ""
+        )
         active = None
+        active_key = None
         ambiguous_tracked = False
         if requested_thread_ts:
             if requested_team_id:
@@ -2965,7 +2997,7 @@ class SlackAdapter(BasePlatformAdapter):
                     requested_team_id, chat_id, requested_thread_ts
                 )
                 if active_key:
-                    active = self._active_status_threads.pop(active_key, None)
+                    active = self._active_status_threads.get(active_key)
             else:
                 # Do not trust the mutable channel-only workspace fallback for
                 # a thread-specific cleanup: Slack Connect workspaces can share
@@ -2977,7 +3009,8 @@ class SlackAdapter(BasePlatformAdapter):
                     if key[1] == str(chat_id) and key[2] == requested_thread_ts
                 ]
                 if len(matching_keys) == 1:
-                    active = self._active_status_threads.pop(matching_keys[0], None)
+                    active_key = matching_keys[0]
+                    active = self._active_status_threads.get(active_key)
                 ambiguous_tracked = len(matching_keys) > 1
         else:
             # Metadata-free cleanup is safe only if exactly one status exists
@@ -2989,7 +3022,8 @@ class SlackAdapter(BasePlatformAdapter):
                 if key[1] == str(chat_id)
             ]
             if len(matching_keys) == 1:
-                active = self._active_status_threads.pop(matching_keys[0], None)
+                active_key = matching_keys[0]
+                active = self._active_status_threads.get(active_key)
         if isinstance(active, str):
             thread_ts = active
             team_id = ""
@@ -2997,6 +3031,20 @@ class SlackAdapter(BasePlatformAdapter):
             active = active or {}
             thread_ts = active.get("thread_ts", "")
             team_id = active.get("team_id", "")
+            active_owner_message_id = str(
+                active.get("owner_message_id") or ""
+            )
+            if (
+                requested_owner_message_id
+                and active_owner_message_id
+                and requested_owner_message_id != active_owner_message_id
+            ):
+                logger.debug(
+                    "[Slack] Skipped stale status clear for channel %s thread %s",
+                    chat_id,
+                    requested_thread_ts,
+                )
+                return
         if metadata:
             team_id = self._metadata_team_id(metadata) or team_id
         if not thread_ts and requested_thread_ts and not ambiguous_tracked:
@@ -3013,14 +3061,52 @@ class SlackAdapter(BasePlatformAdapter):
             team_id = requested_team_id or team_id
         if not thread_ts:
             return
-        try:
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                status="",
-            )
-        except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
+        attempts = max(1, int(self._STATUS_CLEAR_MAX_ATTEMPTS))
+        delays = tuple(self._STATUS_CLEAR_RETRY_DELAYS)
+        for attempt in range(attempts):
+            try:
+                await self._get_client(
+                    chat_id, team_id=team_id
+                ).assistant_threads_setStatus(
+                    channel_id=chat_id,
+                    thread_ts=thread_ts,
+                    status="",
+                )
+            except Exception as e:
+                retryable = self._is_retryable_upload_error(e)
+                if not retryable or attempt >= attempts - 1:
+                    logger.warning(
+                        "[Slack] assistant.threads.setStatus clear failed "
+                        "after %d attempt(s) for channel %s thread %s; "
+                        "the exact clear target remains available for retry: %s",
+                        attempt + 1,
+                        chat_id,
+                        thread_ts,
+                        e,
+                    )
+                    return
+                logger.debug(
+                    "[Slack] assistant.threads.setStatus clear retry %d/%d "
+                    "for channel %s thread %s: %s",
+                    attempt + 1,
+                    attempts,
+                    chat_id,
+                    thread_ts,
+                    e,
+                )
+                delay = delays[min(attempt, len(delays) - 1)] if delays else 0
+                await asyncio.sleep(max(0, delay))
+                continue
+
+            # Remove only the lease that issued this clear. A newer turn may
+            # have replaced the same workspace/channel/thread entry while the
+            # Slack request was in flight.
+            if (
+                active_key is not None
+                and self._active_status_threads.get(active_key) is active
+            ):
+                self._active_status_threads.pop(active_key, None)
+            return
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
