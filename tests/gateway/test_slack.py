@@ -3808,7 +3808,9 @@ class TestSendTyping:
         assert ("T_TWO", "D_SHARED", "171.000") in adapter._active_status_threads
 
     @pytest.mark.asyncio
-    async def test_stop_typing_handles_api_error_gracefully(self, adapter):
+    async def test_stop_typing_keeps_exact_target_after_terminal_api_error(
+        self, adapter, caplog
+    ):
         adapter._active_status_threads[("", "C123", "parent_ts")] = {
             "thread_ts": "parent_ts",
             "team_id": "",
@@ -3817,14 +3819,120 @@ class TestSendTyping:
             side_effect=Exception("missing_scope")
         )
 
-        await adapter.stop_typing("C123")
+        with caplog.at_level("WARNING"):
+            await adapter.stop_typing("C123")
 
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
             status="",
         )
-        assert ("", "C123", "parent_ts") not in adapter._active_status_threads
+        assert ("", "C123", "parent_ts") in adapter._active_status_threads
+        assert "exact clear target remains available for retry" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_retries_transient_clear_and_removes_lease(
+        self, adapter, monkeypatch
+    ):
+        status_key = ("", "C123", "parent_ts")
+        adapter._active_status_threads[status_key] = {
+            "thread_ts": "parent_ts",
+            "team_id": "",
+            "owner_message_id": "reply-1",
+        }
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=[
+                RuntimeError("service unavailable"),
+                RuntimeError("connection reset"),
+                {"ok": True},
+            ]
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep)
+
+        await adapter.stop_typing(
+            "C123",
+            metadata={"thread_id": "parent_ts", "message_id": "reply-1"},
+        )
+
+        assert adapter._app.client.assistant_threads_setStatus.call_count == 3
+        assert sleep.await_args_list == [call(0.1), call(0.5)]
+        assert status_key not in adapter._active_status_threads
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_exhausts_transient_retries_and_warns(
+        self, adapter, monkeypatch, caplog
+    ):
+        status_key = ("", "C123", "parent_ts")
+        adapter._active_status_threads[status_key] = {
+            "thread_ts": "parent_ts",
+            "team_id": "",
+            "owner_message_id": "reply-1",
+        }
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=RuntimeError("service unavailable")
+        )
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        with caplog.at_level("WARNING"):
+            await adapter.stop_typing(
+                "C123",
+                metadata={"thread_id": "parent_ts", "message_id": "reply-1"},
+            )
+
+        assert adapter._app.client.assistant_threads_setStatus.call_count == 3
+        assert status_key in adapter._active_status_threads
+        assert "after 3 attempt(s)" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_stale_turn_cannot_clear_newer_status_lease(self, adapter):
+        metadata = {"thread_id": "parent_ts", "message_id": "reply-old"}
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata=metadata)
+        await adapter.send_typing(
+            "C123",
+            metadata={"thread_id": "parent_ts", "message_id": "reply-new"},
+        )
+        adapter._app.client.assistant_threads_setStatus.reset_mock()
+
+        await adapter.stop_typing("C123", metadata=metadata)
+
+        adapter._app.client.assistant_threads_setStatus.assert_not_called()
+        assert adapter._active_status_threads[
+            ("", "C123", "parent_ts")
+        ]["owner_message_id"] == "reply-new"
+
+    @pytest.mark.asyncio
+    async def test_successful_clear_does_not_remove_newer_inflight_lease(
+        self, adapter
+    ):
+        status_key = ("", "C123", "parent_ts")
+        old_lease = {
+            "thread_ts": "parent_ts",
+            "team_id": "",
+            "owner_message_id": "reply-old",
+        }
+        new_lease = {
+            "thread_ts": "parent_ts",
+            "team_id": "",
+            "owner_message_id": "reply-new",
+        }
+        adapter._active_status_threads[status_key] = old_lease
+
+        async def replace_lease_while_clear_is_inflight(**_kwargs):
+            adapter._active_status_threads[status_key] = new_lease
+            return {"ok": True}
+
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=replace_lease_while_clear_is_inflight
+        )
+
+        await adapter.stop_typing(
+            "C123",
+            metadata={"thread_id": "parent_ts", "message_id": "reply-old"},
+        )
+
+        assert adapter._active_status_threads[status_key] is new_lease
 
     @pytest.mark.asyncio
     async def test_send_clears_status_after_final_post(self, adapter):
