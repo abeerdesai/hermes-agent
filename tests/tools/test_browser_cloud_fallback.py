@@ -40,6 +40,28 @@ class TestCloudProviderRuntimeFallback:
         assert session["features"]["local"] is True
         assert session["cdp_url"] is None
 
+    def test_cloud_failure_does_not_fallback_when_disabled(self, monkeypatch):
+        """A fail-closed profile must never launch local Chromium."""
+        _reset_session_state(monkeypatch)
+
+        provider = Mock()
+        provider.create_session.side_effect = RuntimeError("402 minute limit")
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config",
+            lambda: {
+                "browser": {"fallback_to_local_on_cloud_failure": False}
+            },
+        )
+        local = Mock(side_effect=AssertionError("local Chromium must not start"))
+        monkeypatch.setattr(browser_tool, "_create_local_session", local)
+
+        with pytest.raises(RuntimeError, match="local fallback is disabled"):
+            browser_tool._get_session_info("task-no-local")
+
+        local.assert_not_called()
+
     def test_cloud_success_no_fallback(self, monkeypatch):
         """When cloud succeeds, no fallback markers are present."""
         _reset_session_state(monkeypatch)

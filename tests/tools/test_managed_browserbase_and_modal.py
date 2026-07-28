@@ -234,6 +234,50 @@ def test_browserbase_does_not_use_gateway_only_configuration():
     assert provider.is_available() is False
 
 
+def test_browserbase_key_only_supports_session_lifecycle():
+    _install_fake_tools_package()
+    env = os.environ.copy()
+    env["BROWSERBASE_API_KEY"] = "bb-test-key"
+    env.pop("BROWSERBASE_PROJECT_ID", None)
+    env["BROWSERBASE_PROXIES"] = "false"
+    env["BROWSERBASE_KEEP_ALIVE"] = "false"
+
+    class _CreateResponse:
+        status_code = 201
+        ok = True
+        text = ""
+
+        def json(self):
+            return {
+                "id": "bb-session-key-only",
+                "connectUrl": "wss://connect.browserbase.example/key-only",
+            }
+
+    class _CloseResponse:
+        status_code = 200
+        ok = True
+        text = ""
+
+    with patch.dict(os.environ, env, clear=True):
+        browserbase_module = _load_plugin_module(
+            "plugins.browser.browserbase.provider",
+            "browser/browserbase/provider.py",
+        )
+        provider = browserbase_module.BrowserbaseBrowserProvider()
+
+        with patch.object(
+            browserbase_module.requests,
+            "post",
+            side_effect=[_CreateResponse(), _CloseResponse()],
+        ) as post:
+            assert provider.is_available() is True
+            session = provider.create_session("task-key-only")
+            assert provider.close_session(session["bb_session_id"]) is True
+
+    assert post.call_args_list[0].kwargs["json"] == {}
+    assert post.call_args_list[1].kwargs["json"] == {"status": "REQUEST_RELEASE"}
+
+
 def test_browser_use_availability_skips_refresh_for_expired_cached_gateway_token(tmp_path, monkeypatch):
     _install_fake_tools_package()
     monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
