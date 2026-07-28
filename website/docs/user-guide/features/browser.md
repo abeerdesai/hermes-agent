@@ -44,6 +44,7 @@ To use Browserbase-managed cloud browsers, add:
 ```bash
 # Add to ~/.hermes/.env
 BROWSERBASE_API_KEY=***
+# Optional: Browserbase infers the project from the API key.
 BROWSERBASE_PROJECT_ID=your-project-id-here
 ```
 
@@ -113,6 +114,22 @@ With auto-routing disabled, private URLs are rejected with
 `"Blocked: URL targets a private or internal address"` unless you also set
 `browser.allow_private_urls: true` (which lets the cloud provider attempt them —
 usually won't work since Browserbase etc. can't reach your LAN).
+
+### Fail closed when the cloud provider is unavailable
+
+By default, a cloud session creation failure falls back to local Chromium. On a
+shared workstation where agents must never launch a local browser, disable that
+fallback:
+
+```yaml
+browser:
+  cloud_provider: browserbase
+  auto_local_for_private_urls: false
+  fallback_to_local_on_cloud_failure: false
+```
+
+With this policy, a Browserbase quota, authentication, or network failure is
+reported to the agent instead of starting Chrome on the host.
 
 Requirements: the local sidecar uses the same `agent-browser` CLI as pure local
 mode, so you need it installed (`hermes setup tools → Browser Automation`

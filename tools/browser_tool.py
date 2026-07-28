@@ -2134,6 +2134,36 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                     session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
             except Exception as e:
                 provider_name = type(provider).__name__
+                fallback_to_local = True
+                try:
+                    from hermes_cli.config import read_raw_config
+
+                    raw_config = read_raw_config()
+                    browser_config = raw_config.get("browser", {})
+                    if isinstance(browser_config, dict):
+                        fallback_to_local = (
+                            browser_config.get(
+                                "fallback_to_local_on_cloud_failure", True
+                            )
+                            is not False
+                        )
+                except Exception as config_error:
+                    logger.debug(
+                        "Could not read cloud fallback policy; using default: %s",
+                        config_error,
+                    )
+
+                if not fallback_to_local:
+                    logger.warning(
+                        "Cloud provider %s failed; local fallback is disabled for task %s",
+                        provider_name,
+                        task_id,
+                        exc_info=True,
+                    )
+                    raise RuntimeError(
+                        f"Cloud provider {provider_name} failed and local fallback is disabled"
+                    ) from e
+
                 logger.warning(
                     "Cloud provider %s failed (%s); attempting fallback to local "
                     "Chromium for task %s",

@@ -316,10 +316,9 @@ def test_setup_summary_shows_camofox_when_browser_feature_is_camofox(tmp_path, m
     assert "Browser Automation (Camofox)" in output
 
 
-def test_setup_summary_does_not_mark_incomplete_browserbase_as_available(tmp_path, monkeypatch, capsys):
+def test_setup_summary_reports_missing_browserbase_api_key(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _clear_provider_env(monkeypatch)
-    monkeypatch.setenv("BROWSERBASE_API_KEY", "bb-key")
     monkeypatch.setattr(
         "hermes_cli.setup.get_nous_subscription_features",
         lambda config: NousSubscriptionFeatures(
@@ -343,7 +342,8 @@ def test_setup_summary_does_not_mark_incomplete_browserbase_as_available(tmp_pat
 
     assert "Browser Automation (Browserbase)" not in output
     assert "Browser Automation" in output
-    assert "BROWSERBASE_API_KEY/BROWSERBASE_PROJECT_ID" in output
+    assert "BROWSERBASE_API_KEY" in output
+    assert "BROWSERBASE_PROJECT_ID" not in output
 
 
 def test_setup_summary_local_browser_unavailable_without_chromium(

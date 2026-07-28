@@ -1269,6 +1269,7 @@ DEFAULT_CONFIG = {
         # Also settable via AGENT_BROWSER_ENGINE env var.
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
+        "fallback_to_local_on_cloud_failure": True,  # Permit local Chromium fallback when cloud session creation fails
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
         "allow_unsafe_evaluate": False,  # Legacy override: when true, browser_console(expression=...) bypasses the restrict_evaluate denylist entirely
         "restrict_evaluate": False,  # Opt-in denylist blocking sensitive JS primitives (cookies/storage/clipboard/network/form values) in browser_console(expression=...)

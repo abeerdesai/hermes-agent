@@ -5,8 +5,9 @@ ABC introduced in PR #25214). The legacy in-tree module
 ``tools.browser_providers.browserbase`` was removed in the same PR; this file
 is now the canonical implementation.
 
-Browserbase requires direct ``BROWSERBASE_API_KEY`` and ``BROWSERBASE_PROJECT_ID``
-credentials. Managed Nous gateway support has been removed — the Nous
+Browserbase requires a direct ``BROWSERBASE_API_KEY`` credential. An optional
+``BROWSERBASE_PROJECT_ID`` is preserved when configured; otherwise Browserbase
+infers the project from the API key. Managed Nous gateway support has been removed — the Nous
 subscription now routes through Browser Use instead (see
 ``plugins/browser/browser_use/``).
 
@@ -18,7 +19,7 @@ Config keys this provider responds to::
 Auth env vars::
 
     BROWSERBASE_API_KEY=...       # https://browserbase.com
-    BROWSERBASE_PROJECT_ID=...
+    BROWSERBASE_PROJECT_ID=...    # optional; inferred from the API key
 
 Optional feature knobs::
 
@@ -68,22 +69,23 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     def _get_config_or_none(self) -> Optional[Dict[str, Any]]:
         api_key = os.environ.get("BROWSERBASE_API_KEY")
         project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-        if api_key and project_id:
-            return {
+        if api_key:
+            config = {
                 "api_key": api_key,
-                "project_id": project_id,
                 "base_url": os.environ.get(
                     "BROWSERBASE_BASE_URL", "https://api.browserbase.com"
                 ).rstrip("/"),
             }
+            if project_id:
+                config["project_id"] = project_id
+            return config
         return None
 
     def _get_config(self) -> Dict[str, Any]:
         config = self._get_config_or_none()
         if config is None:
             raise ValueError(
-                "Browserbase requires BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID "
-                "environment variables."
+                "Browserbase requires the BROWSERBASE_API_KEY environment variable."
             )
         return config
 
@@ -112,7 +114,9 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             "custom_timeout": False,
         }
 
-        session_config: Dict[str, object] = {"projectId": config["project_id"]}
+        session_config: Dict[str, object] = {}
+        if config.get("project_id"):
+            session_config["projectId"] = config["project_id"]
 
         if enable_keep_alive:
             session_config["keepAlive"] = True
@@ -224,16 +228,16 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             return False
 
         try:
+            release_config: Dict[str, object] = {"status": "REQUEST_RELEASE"}
+            if config.get("project_id"):
+                release_config["projectId"] = config["project_id"]
             response = requests.post(
                 f"{config['base_url']}/v1/sessions/{session_id}",
                 headers={
                     "X-BB-API-Key": config["api_key"],
                     "Content-Type": "application/json",
                 },
-                json={
-                    "projectId": config["project_id"],
-                    "status": "REQUEST_RELEASE",
-                },
+                json=release_config,
                 timeout=10,
             )
             if response.status_code in {200, 201, 204}:
@@ -260,16 +264,16 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             )
             return
         try:
+            release_config: Dict[str, object] = {"status": "REQUEST_RELEASE"}
+            if config.get("project_id"):
+                release_config["projectId"] = config["project_id"]
             requests.post(
                 f"{config['base_url']}/v1/sessions/{session_id}",
                 headers={
                     "X-BB-API-Key": config["api_key"],
                     "Content-Type": "application/json",
                 },
-                json={
-                    "projectId": config["project_id"],
-                    "status": "REQUEST_RELEASE",
-                },
+                json=release_config,
                 timeout=5,
             )
         except Exception as e:
@@ -287,10 +291,6 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                     "key": "BROWSERBASE_API_KEY",
                     "prompt": "Browserbase API key",
                     "url": "https://browserbase.com",
-                },
-                {
-                    "key": "BROWSERBASE_PROJECT_ID",
-                    "prompt": "Browserbase project ID",
                 },
             ],
             "post_setup": "agent_browser",
