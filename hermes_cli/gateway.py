@@ -1284,7 +1284,7 @@ def _read_launchd_service_snapshot() -> LaunchdServiceSnapshot:
     response omits the PID field.
     """
     label = get_launchd_label()
-    uid = os.getuid()  # windows-footgun: macOS-only caller
+    uid = os.getuid()  # windows-footgun: ok — macOS launchd-only caller
     registered_snapshot: LaunchdServiceSnapshot | None = None
 
     for domain in (f"gui/{uid}", f"user/{uid}"):
