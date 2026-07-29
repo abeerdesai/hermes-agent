@@ -310,11 +310,31 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         pass
 
     # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
-    # cross-platform creation time.  Quantize to centiseconds so repeated reads
-    # of the same process compare equal without float-precision fragility.
+    # cross-platform creation time.  On macOS, psutil's public create_time()
+    # deliberately adjusts the timestamp after a system wall-clock correction.
+    # That is useful for display, but unsafe as a process-identity fingerprint:
+    # the same live PID can appear to have started one second later and be
+    # rejected as recycled.  psutil's Darwin backend exposes the unadjusted
+    # kernel timestamp through its platform process object; prefer that stable
+    # value when available and retain the public API as a compatibility fallback.
+    # Quantize to centiseconds so repeated reads compare without float noise.
     try:
         import psutil  # type: ignore
-        return int(round(psutil.Process(pid).create_time() * 100))
+        process = psutil.Process(pid)
+        create_time = None
+        if sys.platform == "darwin":
+            platform_process = getattr(process, "_proc", None)
+            raw_create_time = getattr(platform_process, "create_time", None)
+            if callable(raw_create_time):
+                try:
+                    create_time = raw_create_time(monotonic=True)
+                except Exception:
+                    # Older psutil releases may not expose the Darwin-only
+                    # ``monotonic`` argument. Fall back to the public API.
+                    create_time = None
+        if create_time is None:
+            create_time = process.create_time()
+        return int(round(create_time * 100))
     except Exception:
         return None
 
@@ -654,6 +674,43 @@ def _pid_from_record(record: Optional[dict[str, Any]]) -> Optional[int]:
         return None
 
 
+def _runtime_start_time_matches_live(
+    pid: int,
+    recorded_start: Any,
+    current_start: Any,
+    *,
+    expected_home: Optional[Path] = None,
+) -> bool:
+    """Validate runtime-state process identity without weakening PID-reuse safety.
+
+    ``gateway_state.json`` is diagnostic state and can be rewritten throughout
+    a gateway's lifetime. Older macOS gateways recomputed its ``start_time``
+    through psutil's wall-clock-adjusted API, so a clock correction could move
+    only that snapshot while the canonical ``gateway.pid`` identity remained
+    stable. Permit that mismatch only when the profile-scoped PID record names
+    the same PID and its exact start fingerprint matches the live process.
+
+    A recycled PID still fails: both the runtime snapshot and canonical PID
+    record would carry the previous process's fingerprint, which cannot equal
+    the new live process's start time.
+    """
+    if recorded_start is None or current_start is None:
+        return True
+    if recorded_start == current_start:
+        return True
+
+    pid_path = (
+        expected_home / "gateway.pid"
+        if expected_home is not None
+        else _get_pid_path()
+    )
+    pid_record = _read_pid_record(pid_path)
+    if _pid_from_record(pid_record) != pid:
+        return False
+    canonical_start = (pid_record or {}).get("start_time")
+    return canonical_start is not None and canonical_start == current_start
+
+
 def _clear_running_pid_cache() -> None:
     with _gateway_running_pid_cache_lock:
         _gateway_running_pid_cache.clear()
@@ -989,6 +1046,14 @@ def write_runtime_status(
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
+    pid_record = _read_pid_record()
+    if _pid_from_record(pid_record) == current_record["pid"]:
+        canonical_start = (pid_record or {}).get("start_time")
+        if isinstance(canonical_start, int) and not isinstance(canonical_start, bool):
+            # The PID file is the process-lifetime identity record. Reuse its
+            # original fingerprint instead of recomputing a display-adjusted
+            # macOS timestamp on every runtime-status heartbeat.
+            current_record["start_time"] = canonical_start
     payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
@@ -1061,21 +1126,21 @@ def runtime_status_is_stale(
 def runtime_status_pid_is_live(record: Optional[dict[str, Any]]) -> bool:
     """Return True when the PID recorded in the snapshot is still alive.
 
-    Uses the existing no-kill :func:`_pid_exists` probe and the same
-    ``start_time`` PID-reuse guard as :func:`get_runtime_status_running_pid`:
-    when both the recorded and live start-times are known they must match, so a
-    recycled PID (same number, different process) is not mistaken for the
-    original.  Degrades to ``False`` when the record has no usable PID.
+    Uses the existing no-kill :func:`_pid_exists` probe and the same exact
+    ``start_time`` PID-reuse guard as :func:`get_runtime_status_running_pid`.
+    A clock-shifted diagnostic timestamp is accepted only when the canonical
+    PID record exactly matches the live process. Degrades to ``False`` when the
+    record has no usable PID.
     """
     pid = _pid_from_record(record)
     if pid is None or not _pid_exists(pid):
         return False
     recorded_start = (record or {}).get("start_time")
     current_start = _get_process_start_time(pid)
-    if (
-        recorded_start is not None
-        and current_start is not None
-        and current_start != recorded_start
+    if not _runtime_start_time_matches_live(
+        pid,
+        recorded_start,
+        current_start,
     ):
         return False
     return True
@@ -1312,10 +1377,11 @@ def get_runtime_status_running_pid(
 
     recorded_start = payload.get("start_time")
     current_start = _get_process_start_time(pid)
-    if (
-        recorded_start is not None
-        and current_start is not None
-        and current_start != recorded_start
+    if not _runtime_start_time_matches_live(
+        pid,
+        recorded_start,
+        current_start,
+        expected_home=expected_home,
     ):
         return None
 

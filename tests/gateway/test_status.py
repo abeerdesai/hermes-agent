@@ -461,6 +461,97 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid()
         assert payload["start_time"] == 2000
 
+    def test_write_runtime_status_preserves_canonical_pid_fingerprint(
+        self, tmp_path, monkeypatch
+    ):
+        """A later wall-clock correction must not rewrite process identity."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway.pid").write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "kind": "hermes-gateway",
+                    "argv": ["hermes", "gateway", "run"],
+                    "start_time": 100,
+                }
+            )
+        )
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 200)
+
+        status.write_runtime_status(gateway_state="running")
+
+        payload = status.read_runtime_status()
+        assert payload["pid"] == os.getpid()
+        assert payload["start_time"] == 100
+
+    def test_runtime_status_accepts_canonical_pid_identity_after_clock_shift(
+        self, tmp_path, monkeypatch
+    ):
+        """A drifted diagnostic snapshot is live when gateway.pid matches exactly."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid = 4242
+        (tmp_path / "gateway.pid").write_text(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "kind": "hermes-gateway",
+                    "argv": ["hermes", "gateway", "run"],
+                    "start_time": 100,
+                }
+            )
+        )
+        payload = {
+            "pid": pid,
+            "start_time": 200,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+        }
+        monkeypatch.setattr(status, "_pid_exists", lambda candidate: candidate == pid)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 100)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "hermes gateway run --replace",
+        )
+
+        assert status.runtime_status_pid_is_live(payload) is True
+        assert status.get_runtime_status_running_pid(payload) == pid
+
+    def test_runtime_status_rejects_recycled_pid_despite_stability_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """The canonical fallback must not turn a real PID reuse into a match."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid = 4242
+        (tmp_path / "gateway.pid").write_text(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "kind": "hermes-gateway",
+                    "argv": ["hermes", "gateway", "run"],
+                    "start_time": 100,
+                }
+            )
+        )
+        payload = {
+            "pid": pid,
+            "start_time": 200,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+        }
+        monkeypatch.setattr(status, "_pid_exists", lambda candidate: candidate == pid)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 300)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "hermes gateway run --replace",
+        )
+
+        assert status.runtime_status_pid_is_live(payload) is False
+        assert status.get_runtime_status_running_pid(payload) is None
+
     def test_runtime_status_running_pid_rejects_stale_record_for_supervisor_pid(self, monkeypatch):
         """Regression: stale profile runtime state must not mark s6 supervisors live.
 
@@ -716,6 +807,57 @@ class TestGetProcessStartTime:
         finally:
             p.kill()
             p.wait()
+
+    def test_macos_prefers_unadjusted_kernel_start_time(self, monkeypatch):
+        """Darwin identity must ignore psutil's wall-clock display adjustment."""
+        original_read_text = Path.read_text
+
+        def no_proc(self, *args, **kwargs):
+            if str(self).startswith("/proc/"):
+                raise FileNotFoundError
+            return original_read_text(self, *args, **kwargs)
+
+        raw_calls = []
+
+        def raw_create_time(*, monotonic=False):
+            raw_calls.append(monotonic)
+            return 123.45
+
+        fake_process = SimpleNamespace(
+            _proc=SimpleNamespace(create_time=raw_create_time),
+            create_time=lambda: (_ for _ in ()).throw(
+                AssertionError("adjusted create_time must not be used")
+            ),
+        )
+        fake_psutil = SimpleNamespace(Process=lambda _pid: fake_process)
+        monkeypatch.setattr(Path, "read_text", no_proc)
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        assert status._get_process_start_time(42) == 12345
+        assert raw_calls == [True]
+
+    def test_macos_falls_back_when_raw_start_time_is_unavailable(self, monkeypatch):
+        """Older psutil builds retain the existing public-API stability path."""
+        original_read_text = Path.read_text
+
+        def no_proc(self, *args, **kwargs):
+            if str(self).startswith("/proc/"):
+                raise FileNotFoundError
+            return original_read_text(self, *args, **kwargs)
+
+        fake_process = SimpleNamespace(
+            _proc=SimpleNamespace(
+                create_time=lambda **_kwargs: (_ for _ in ()).throw(TypeError())
+            ),
+            create_time=lambda: 321.09,
+        )
+        fake_psutil = SimpleNamespace(Process=lambda _pid: fake_process)
+        monkeypatch.setattr(Path, "read_text", no_proc)
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        assert status._get_process_start_time(42) == 32109
 
 
 class TestTerminatePid:
