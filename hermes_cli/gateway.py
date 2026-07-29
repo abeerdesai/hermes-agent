@@ -94,6 +94,15 @@ class ProfileGatewayProcess:
     pid: int
 
 
+@dataclass(frozen=True)
+class LaunchdServiceSnapshot:
+    """Read-only launchd registration and supervision state."""
+
+    registered: bool
+    pid: int | None = None
+    output: str = ""
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -143,33 +152,9 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
-        try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=5,
-            )
-            if result.returncode == 0:
-                # Try plist format first (macOS 26+): "PID" = <N>;
-                pid = _parse_launchd_pid_from_list_output(result.stdout)
-                if pid is not None and pid > 0:
-                    pids.add(pid)
-                else:
-                    # Fall back to legacy tab-separated format:
-                    # "PID\tStatus\tLabel"
-                    for line in result.stdout.strip().splitlines():
-                        parts = line.split()
-                        if len(parts) >= 3 and parts[2] == label:
-                            try:
-                                pid = int(parts[0])
-                                if pid > 0:
-                                    pids.add(pid)
-                            except ValueError:
-                                pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        snapshot = _read_launchd_service_snapshot()
+        if snapshot.pid is not None:
+            pids.add(snapshot.pid)
 
     return pids
 
@@ -1252,50 +1237,130 @@ def _recover_pending_systemd_restart(
 
 
 def _parse_launchd_pid_from_list_output(output: str) -> int | None:
-    """Extract the PID from ``launchctl list <label>`` output.
+    """Extract the PID from ``launchctl print`` or ``list`` output.
 
     When launchd is actively supervising a process, the output includes a
-    ``"PID" = <number>;`` line.  When the service definition is only *registered*
-    but not running (macOS 26+ with an unmanageable domain, fallback active),
-    the output lacks a PID field entirely.  Returns ``None`` when no PID is
-    found or the PID is non-positive (e.g. ``-1`` for a recently-crashed service).
+    ``pid = <number>`` or ``"PID" = <number>;`` line. When the service
+    definition is only registered but not running, the output lacks a PID
+    field. Returns ``None`` when no PID is found or the PID is non-positive
+    (e.g. ``-1`` for a recently-crashed service).
     """
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith('"PID"') or stripped.startswith("PID"):
-            parts = stripped.split("=", 1)
-            if len(parts) == 2:
-                val = parts[1].strip().rstrip(";").strip('"')
-                try:
-                    pid = int(val)
-                    return pid if pid > 0 else None
-                except ValueError:
-                    return None
+        parts = stripped.split("=", 1)
+        if len(parts) != 2 or parts[0].strip().strip('"').lower() != "pid":
+            continue
+        val = parts[1].strip().rstrip(";").strip('"')
+        try:
+            pid = int(val)
+            return pid if pid > 0 else None
+        except ValueError:
+            return None
     return None
+
+
+def _parse_launchd_legacy_list_pid(output: str, label: str) -> int | None:
+    """Extract a PID from legacy tab-separated ``launchctl list`` output."""
+    for line in output.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] != label:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
+    return None
+
+
+def _read_launchd_service_snapshot() -> LaunchdServiceSnapshot:
+    """Read the current profile's launchd state from its scoped domain.
+
+    Modern launchd stores user agents in ``gui/<uid>`` or ``user/<uid>``.
+    ``launchctl list <label>`` can be unavailable to sandboxed callers even
+    while a domain-scoped ``launchctl print`` succeeds, so probe both domains
+    directly first. Retain ``list`` as a compatibility fallback for older
+    launchd output and as a supplemental PID source when a successful print
+    response omits the PID field.
+    """
+    label = get_launchd_label()
+    uid = os.getuid()  # windows-footgun: macOS-only caller
+    registered_snapshot: LaunchdServiceSnapshot | None = None
+
+    for domain in (f"gui/{uid}", f"user/{uid}"):
+        target = f"{domain}/{label}"
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", target],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except (
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ):
+            continue
+        if result.returncode != 0:
+            continue
+
+        pid = _parse_launchd_pid_from_list_output(result.stdout)
+        registered_snapshot = LaunchdServiceSnapshot(
+            registered=True,
+            pid=pid,
+            output=result.stdout,
+        )
+        if pid is not None:
+            return registered_snapshot
+        # The same label can be registered but idle in one user domain while
+        # the active job lives in the other. Retain this registration evidence
+        # and continue probing for an authoritative supervised PID.
+        continue
+
+    # Compatibility fallback: old macOS releases and some test/service
+    # environments expose only the global label lookup.
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
+        return registered_snapshot or LaunchdServiceSnapshot(registered=False)
+
+    if result.returncode == 0:
+        pid = _parse_launchd_pid_from_list_output(result.stdout)
+        if pid is None:
+            pid = _parse_launchd_legacy_list_pid(result.stdout, label)
+        return LaunchdServiceSnapshot(
+            registered=True,
+            pid=pid,
+            output=result.stdout
+            or (registered_snapshot.output if registered_snapshot else ""),
+        )
+    return registered_snapshot or LaunchdServiceSnapshot(registered=False)
 
 
 def _probe_launchd_service_running() -> bool:
     """Return True when launchd is actively supervising the gateway process.
 
-    ``launchctl list <label>`` returns exit 0 whenever the service definition is
-    registered with launchd — even when ``state = not running`` (macOS 26+).
-    We additionally require a PID in the output to confirm launchd is actually
-    managing a live process, not just holding a static definition.
+    Registration alone is insufficient: require a positive PID from the
+    domain-scoped launchd snapshot to distinguish a supervised gateway from a
+    static definition or detached fallback process.
     """
     if not get_launchd_plist_path().exists():
         return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    if result.returncode != 0:
-        return False
-    return _parse_launchd_pid_from_list_output(result.stdout) is not None
+    return _read_launchd_service_snapshot().pid is not None
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -2926,6 +2991,117 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     )
 
 
+def _immutable_release_sha_for_root(root: Path) -> str | None:
+    """Return the SHA encoded by an immutable Hermes release root."""
+    import re
+
+    parts = root.parts
+    for index, part in enumerate(parts):
+        if part != "releases" or index + 2 >= len(parts):
+            continue
+        sha = parts[index + 1]
+        if (
+            re.fullmatch(r"[0-9a-fA-F]{40}", sha)
+            and parts[index + 2] == "hermes-agent"
+            and index + 3 == len(parts)
+        ):
+            return sha.lower()
+    return None
+
+
+def _current_project_revision() -> str | None:
+    """Return the source revision represented by the invoking Hermes runtime."""
+    release_sha = _immutable_release_sha_for_root(PROJECT_ROOT)
+    if release_sha is not None:
+        return release_sha
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    revision = result.stdout.strip().lower()
+    if result.returncode != 0 or len(revision) != 40:
+        return None
+    try:
+        int(revision, 16)
+    except ValueError:
+        return None
+    return revision
+
+
+def _launchd_plist_matches_current_immutable_release(
+    installed: str,
+    expected: str,
+) -> bool:
+    """Accept a self-consistent immutable release for the current source SHA.
+
+    Operators may invoke the CLI from a mutable controlled checkout while the
+    launchd service correctly remains pinned to an immutable release directory.
+    A raw definition comparison sees different interpreter and virtualenv paths
+    and calls that service stale. Treat those two paths as equivalent only when
+    the installed definition is internally consistent, its release directory
+    still exists, and its encoded 40-character SHA exactly matches the invoking
+    checkout's revision. All other launchd settings must remain equal.
+    """
+    import plistlib
+
+    try:
+        installed_payload = plistlib.loads(installed.encode("utf-8"))
+        expected_payload = plistlib.loads(expected.encode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(installed_payload, dict) or not isinstance(expected_payload, dict):
+        return False
+
+    installed_args = installed_payload.get("ProgramArguments")
+    installed_env = installed_payload.get("EnvironmentVariables")
+    expected_args = expected_payload.get("ProgramArguments")
+    expected_env = expected_payload.get("EnvironmentVariables")
+    if not (
+        isinstance(installed_args, list)
+        and installed_args
+        and isinstance(installed_args[0], str)
+        and isinstance(installed_env, dict)
+        and isinstance(installed_env.get("VIRTUAL_ENV"), str)
+        and isinstance(expected_args, list)
+        and expected_args
+        and isinstance(expected_env, dict)
+    ):
+        return False
+
+    installed_program = Path(
+        os.path.abspath(os.path.expanduser(installed_args[0]))
+    )
+    installed_venv = Path(
+        os.path.abspath(os.path.expanduser(installed_env["VIRTUAL_ENV"]))
+    )
+    release_root = installed_venv.parent
+    release_sha = _immutable_release_sha_for_root(release_root)
+    if (
+        release_sha is None
+        or release_sha != _current_project_revision()
+        or installed_program.parent != installed_venv / "bin"
+        or not installed_program.is_file()
+        or not installed_venv.is_dir()
+    ):
+        return False
+
+    # PATH is intentionally ignored by the existing text normalizer because it
+    # varies by invoking shell. Normalize it structurally here as well.
+    installed_env.pop("PATH", None)
+    expected_env.pop("PATH", None)
+    expected_args[0] = installed_args[0]
+    expected_env["VIRTUAL_ENV"] = installed_env["VIRTUAL_ENV"]
+    return installed_payload == expected_payload
+
+
 def systemd_unit_is_current(system: bool = False) -> bool:
     # ── HERMES_HOME sync chokepoint ──────────────────────────────────────
     # Every path that compares OR regenerates the unit funnels through here:
@@ -4062,9 +4238,11 @@ def launchd_plist_is_current() -> bool:
 
     installed = plist_path.read_text(encoding="utf-8")
     expected = generate_launchd_plist()
-    return _normalize_launchd_plist_for_comparison(
+    if _normalize_launchd_plist_for_comparison(
         installed
-    ) == _normalize_launchd_plist_for_comparison(expected)
+    ) == _normalize_launchd_plist_for_comparison(expected):
+        return True
+    return _launchd_plist_matches_current_immutable_release(installed, expected)
 
 
 def refresh_launchd_plist_if_needed() -> bool:
@@ -4507,25 +4685,10 @@ def launchd_restart():
 
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
-    label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=10,
-        )
-        service_listed = result.returncode == 0
-        list_output = result.stdout
-    except subprocess.TimeoutExpired:
-        service_listed = False
-        list_output = ""
-
-    # Determine whether launchd is actively supervising a process.
-    # ``launchctl list`` returns exit 0 whenever the service definition is
-    # registered — even when ``state = not running`` (macOS 26+ with an
-    # unmanageable domain).  A PID in the output confirms a live process.
-    launchd_pid = _parse_launchd_pid_from_list_output(list_output) if service_listed else None
+    service_snapshot = _read_launchd_service_snapshot()
+    service_listed = service_snapshot.registered
+    launchd_pid = service_snapshot.pid
+    service_output = service_snapshot.output
 
     # Hermes PID tracking — may be a detached fallback process spawned when
     # launchd cannot manage the domain on this host.
@@ -4569,7 +4732,7 @@ def launchd_status(deep: bool = False):
             print("  ⚠ Auto-start at login and auto-restart on crash are NOT available.")
         else:
             print("✓ Gateway service is registered with launchd")
-            print(list_output)
+            print(service_output)
             if fallback_pid:
                 print(f"  Detached gateway process is running (PID {fallback_pid})")
     else:

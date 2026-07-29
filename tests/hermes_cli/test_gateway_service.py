@@ -991,6 +991,74 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_plist_accepts_matching_immutable_release(
+        self, tmp_path, monkeypatch
+    ):
+        """A checkout CLI must recognize its same-SHA immutable service."""
+        import plistlib
+
+        sha = "a" * 40
+        release_venv = (
+            tmp_path
+            / ".hermes"
+            / "releases"
+            / sha
+            / "hermes-agent"
+            / "venv"
+        )
+        release_python = release_venv / "bin" / "python"
+        release_python.parent.mkdir(parents=True)
+        release_python.touch()
+
+        payload = plistlib.loads(
+            gateway_cli.generate_launchd_plist().encode("utf-8")
+        )
+        payload["ProgramArguments"][0] = str(release_python)
+        payload["EnvironmentVariables"]["VIRTUAL_ENV"] = str(release_venv)
+
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_bytes(plistlib.dumps(payload))
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_current_project_revision", lambda: sha)
+
+        assert gateway_cli.launchd_plist_is_current() is True
+
+    def test_launchd_plist_rejects_different_immutable_release_revision(
+        self, tmp_path, monkeypatch
+    ):
+        """A genuinely older release must still be reported stale."""
+        import plistlib
+
+        installed_sha = "a" * 40
+        release_venv = (
+            tmp_path
+            / ".hermes"
+            / "releases"
+            / installed_sha
+            / "hermes-agent"
+            / "venv"
+        )
+        release_python = release_venv / "bin" / "python"
+        release_python.parent.mkdir(parents=True)
+        release_python.touch()
+
+        payload = plistlib.loads(
+            gateway_cli.generate_launchd_plist().encode("utf-8")
+        )
+        payload["ProgramArguments"][0] = str(release_python)
+        payload["EnvironmentVariables"]["VIRTUAL_ENV"] = str(release_venv)
+
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_bytes(plistlib.dumps(payload))
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_current_project_revision",
+            lambda: "b" * 40,
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
     def test_launchd_domain_uses_user_domain(self, monkeypatch):
         # The user/<uid> domain (not gui/<uid>) is the one reachable from
         # non-Aqua/background sessions on macOS 26+ (issue #23387).
@@ -1234,6 +1302,11 @@ class TestLaunchdServiceRecovery:
         output = "{\n    PID = 99999;\n}"
         assert gateway_cli._parse_launchd_pid_from_list_output(output) == 99999
 
+    def test_parse_launchd_pid_from_domain_print_output(self):
+        """Modern domain-scoped print output uses a lowercase pid key."""
+        output = "gui/501/ai.hermes.gateway = {\n\tstate = running\n\tpid = 24680\n}"
+        assert gateway_cli._parse_launchd_pid_from_list_output(output) == 24680
+
     def test_parse_launchd_pid_from_list_output_negative_pid_returns_none(self):
         """PID = -1 (recently-crashed service sentinel) must return None."""
         output = '{\n    "PID" = -1;\n    "Label" = "ai.hermes.gateway";\n}'
@@ -1271,6 +1344,105 @@ class TestLaunchdServiceRecovery:
                 stderr="",
             ),
         )
+        assert gateway_cli._probe_launchd_service_running() is True
+
+    def test_probe_launchd_prefers_domain_print_when_list_is_sandboxed(
+        self, tmp_path, monkeypatch
+    ):
+        """A sandboxed list lookup must not hide a domain-supervised process."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["launchctl", "print"] and "gui/501/" in cmd[2]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "gui/501/ai.hermes.gateway = {\n"
+                        "\tstate = running\n"
+                        "\tpid = 55555\n"
+                        "}"
+                    ),
+                    stderr="",
+                )
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._probe_launchd_service_running() is True
+        assert calls[0] == [
+            "launchctl",
+            "print",
+            "gui/501/ai.hermes.gateway",
+        ]
+        assert not any(call[:2] == ["launchctl", "list"] for call in calls)
+
+    def test_probe_launchd_registered_without_pid_is_not_supervised(
+        self, tmp_path, monkeypatch
+    ):
+        """A loaded but non-running job remains distinct from supervision."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["launchctl", "print"] and "gui/501/" in cmd[2]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "gui/501/ai.hermes.gateway = {\n"
+                        "\tstate = not running\n"
+                        "}"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._probe_launchd_service_running() is False
+
+    def test_probe_launchd_continues_to_running_user_domain(
+        self, tmp_path, monkeypatch
+    ):
+        """An idle gui registration must not hide a running user-domain job."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        def fake_run(cmd, **_kwargs):
+            if cmd == [
+                "launchctl",
+                "print",
+                "gui/501/ai.hermes.gateway",
+            ]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="state = not running",
+                    stderr="",
+                )
+            if cmd == [
+                "launchctl",
+                "print",
+                "user/501/ai.hermes.gateway",
+            ]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="state = running\npid = 56565",
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
         assert gateway_cli._probe_launchd_service_running() is True
 
     # ── Unsupport marker lifecycle ───────────────────────────────────────
@@ -1330,6 +1502,83 @@ class TestLaunchdServiceRecovery:
         out = capsys.readouterr().out
         assert "supervised by launchd" in out
         assert "Auto-start at login" in out
+
+    def test_launchd_status_reports_domain_supervision_when_list_is_sandboxed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Status trusts domain-scoped print when global list is unavailable."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["launchctl", "print"] and "gui/501/" in cmd[2]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "gui/501/ai.hermes.gateway = {\n"
+                        "\tstate = running\n"
+                        "\tpid = 77777\n"
+                        "}"
+                    ),
+                    stderr="",
+                )
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=113, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda cleanup_stale=False: 77777,
+        )
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "supervised by launchd (PID 77777)" in out
+        assert "not loaded" not in out.lower()
+
+    def test_launchd_status_keeps_registered_detached_state_distinct(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A registered job without a launchd PID may still have a fallback."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ["launchctl", "print"] and "gui/501/" in cmd[2]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(
+                        "gui/501/ai.hermes.gateway = {\n"
+                        "\tstate = not running\n"
+                        "}"
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda cleanup_stale=False: 88888,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_unsupported_marker_exists",
+            lambda: False,
+        )
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "registered with launchd" in out
+        assert "Detached gateway process is running (PID 88888)" in out
+        assert "supervised by launchd" not in out
 
     def test_launchd_status_reports_fallback_when_unsupported_and_pid_running(self, tmp_path, monkeypatch, capsys):
         """When the unsupported marker exists and a fallback PID is running."""
